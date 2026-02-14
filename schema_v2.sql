@@ -1,0 +1,145 @@
+PRAGMA foreign_keys = ON;
+
+-- =========================
+-- Reference / Dimensions
+-- =========================
+
+CREATE TABLE IF NOT EXISTS ticker_data (
+  ticker           TEXT PRIMARY KEY,
+  company_name     TEXT,
+  short_name       TEXT,
+  sector           TEXT,
+  industry         TEXT,
+  exchange         TEXT,
+  website          TEXT,
+  cik              TEXT,            -- for later move to SEC as source
+  currency         TEXT,
+  country          TEXT,
+  first_seen_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS index_data (
+  ticker       TEXT PRIMARY KEY,
+  index_name   TEXT,
+  short_name   TEXT
+);
+
+-- =========================
+-- Operational logging
+-- =========================
+
+CREATE TABLE IF NOT EXISTS runs (
+  run_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_name          TEXT NOT NULL,        -- e.g. 'inside_scrape' or 'price_pull'
+  started_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at       TEXT,
+  status            TEXT NOT NULL DEFAULT 'RUNNING', -- RUNNING / SUCCESS / FAILED
+  rows_inserted     INTEGER NOT NULL DEFAULT 0,
+  rows_updated      INTEGER NOT NULL DEFAULT 0,
+  error_message     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_job_started
+ON runs (job_name, started_at);
+
+-- =========================
+-- Insider transactions
+-- =========================
+
+CREATE TABLE IF NOT EXISTS insider_data (
+  transaction_id   TEXT PRIMARY KEY,
+  source           TEXT NOT NULL DEFAULT 'openinsider',
+  scraped_at       TEXT NOT NULL DEFAULT (datetime('now')),
+
+  filing_date      TEXT NOT NULL CHECK (length(filing_date)=10),
+  trade_date       TEXT CHECK (trade_date IS NULL OR length(trade_date)=10),
+  ticker           TEXT NOT NULL,
+
+  insider_name     TEXT,
+  title            TEXT,
+
+  -- transaction classification / codes
+  sec_tx_code      TEXT,      -- P/S/A etc when you can map it
+  x_flags          TEXT,      -- raw flags like 'DM'
+  is_open_market   INTEGER CHECK (is_open_market IN (0,1)),
+  classification   TEXT CHECK (classification IN ('OPEN_MARKET','OPTION_EXERCISE','OTHER','UNKNOWN')),      -- e.g. OPEN_MARKET / OPTION_EXERCISE / OTHER / UNKNOWN
+
+  price            REAL CHECK (price IS NULL OR price >= 0),
+  qty              INTEGER CHECK (qty IS NULL OR qty >= 0),
+  value            REAL,
+
+  -- technical snapshot (optional)
+  low_52           REAL,
+  high_52          REAL,
+  avg_50           REAL,
+  avg_200          REAL,
+
+  source_url       TEXT NOT NULL,
+
+  FOREIGN KEY (ticker) REFERENCES ticker_data (ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_insider_ticker_trade_date
+ON insider_data (ticker, trade_date);
+
+CREATE INDEX IF NOT EXISTS idx_insider_ticker_filing_date
+ON insider_data (ticker, filing_date);
+
+CREATE INDEX IF NOT EXISTS idx_insider_insider_name
+ON insider_data (insider_name);
+
+-- This helps prevent accidental duplicates if your hash ever changes:
+-- adjust columns to match your "natural key" choice.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_insider_natural_key
+ON insider_data (source_url, trade_date, ticker, insider_name, price, qty);
+
+-- =========================
+-- Daily prices (OHLCV + adj_close)
+-- =========================
+
+CREATE TABLE IF NOT EXISTS pricing_data (
+  ticker        TEXT NOT NULL,
+  date          TEXT NOT NULL CHECK (length(date)=10),            -- YYYY-MM-DD
+  open          REAL,
+  high          REAL,
+  low           REAL,
+  close         REAL,
+  adj_close     REAL,
+  volume        INTEGER CHECK (volume IS NULL OR volume >=0),
+  source        TEXT NOT NULL DEFAULT 'yahoo',
+  fetched_at    TEXT NOT NULL DEFAULT (datetime('now')),
+
+  PRIMARY KEY (ticker, date),
+  FOREIGN KEY (ticker) REFERENCES ticker_data (ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pricing_date ON pricing_data(date);
+
+-- =========================
+-- Corporate actions (splits/dividends)
+-- =========================
+
+CREATE TABLE IF NOT EXISTS corporate_actions (
+  ticker            TEXT NOT NULL,
+  action_date       TEXT NOT NULL CHECK (length(action_date)=10),        -- effective/ex-date for the action
+  action_type       TEXT NOT NULL CHECK (action_type IN ('SPLIT','DIVIDEND')),        -- 'SPLIT' or 'DIVIDEND'
+
+  -- SPLIT fields (use either ratio OR numerator/denominator)
+  split_ratio       REAL CHECK (split_ratio IS NULL OR split_ratio >0),                 -- e.g. 2.0 for a 2-for-1
+  split_numerator   REAL,
+  split_denominator REAL,
+
+  -- DIVIDEND fields
+  dividend_cash     REAL CHECK (dividend_cash IS NULL OR dividend_cash >= 0),                 -- cash dividend per share
+
+  source            TEXT NOT NULL DEFAULT 'yahoo',
+  fetched_at        TEXT NOT NULL DEFAULT (datetime('now')),
+
+  PRIMARY KEY (ticker, action_date, action_type),
+  FOREIGN KEY (ticker) REFERENCES ticker_data (ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_corp_actions_ticker_date
+ON corporate_actions (ticker, action_date);
+
