@@ -3,59 +3,47 @@ import pandas as pd
 import yfinance as yf
 import sqlite3
 import logging
+from logging.handlers import RotatingFileHandler
 import pytz
 import sys
 from bs4 import BeautifulSoup as bs
 from datetime import datetime, timedelta
+from urllib.parse import urljoin
 
-# set up logging
-logging.basicConfig(filename='scraper.log',
-                    level=logging.ERROR,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-
+OPENINSIDER_BASE = "https://openinsider.com/"
+SEC_HTTP = "http://www.sec.gov/"
+SEC_HTTPS = "https://www.sec.gov/"
 
 def main(db):
 
-    # set up database
     # set cursor
     cursor = db.cursor()
 
-    # define webpages
-    clusterPage = "http://openinsider.com/latest-cluster-buys"
-    insidersPage = 'http://openinsider.com/insider-purchases-25k'
+    # define webpage
+    
+    insider_page_url = 'http://openinsider.com/screener?s=&o=&pl=&ph=&ll=&lh=&fd=730&fdr=&td=0&tdr=&fdlyl=&fdlyh=&daysago=&xp=1&xs=1&vl=&vh=&ocl=&och=&sic1=-1&sicl=100&sich=9999&grp=0&nfl=&nfh=&nil=&nih=&nol=&noh=&v2l=&v2h=&oc2l=&oc2h=&sortcol=0&cnt=500&page=1'
 
-    # create dataframe for cluster buys
-    df_cluster = scrape(clusterPage, 'cluster')
-    print(df_cluster.head())
-
-    # send dataframe to insert_tickers to update database with new securities
-    insert_tickers(cursor, df_cluster, db)
-
-    # send cluster dataframe to insert_cluster to update database with new transactions
-    insert_cluster(cursor, df_cluster, db)
-
-    # delete cluster dataframe - we're done with it
-    del df_cluster
-
-
-    # create dataframe for insider buys
-    df_insiders = scrape(insidersPage, 'insider')
-    print(df_insiders.head())
+    # create dataframe for insider transactions
+    df_insiders = scrape(insider_page_url)
+    logger.info('Scraped %d insider rows', len(df_insiders))
+    logger.debug('Head:\n%s', df_insiders.head().to_string())
 
     # send dataframe to insert_tickers to update database with new securities
-    insert_tickers(cursor, df_insiders, db)
+    tickers_inserted = insert_tickers(cursor, df_insiders, db)
 
     # send dataframe to insert_insiders to update database with new transactions
-    insert_insiders(cursor, df_insiders, db)
-
-    # delete insider dataframe - we're done with it
-    del df_insiders
+    tx_inserted, tx_skipped = insert_insiders(cursor, df_insiders, db)
+    
+    logger.info(
+        'DB updates: Inserted tickers=%d, transactions inserted=%d,  skipped=%d',
+        tickers_inserted, tx_inserted, tx_skipped
+    )
 
     # create dataframe for insertion of indexes
     index_data = {
         'Ticker': ['^GSPC', '^DJI', '^IXIC', '^VIX', '^RUT', '^FTW5000'],
         'Name': ['S&P 500', 'Dow Jones Industrial Average', 'NASDAQ',
-                 'CBOE Volatility Index', 'Russel 2000', 'Wilshire 5000']
+                 'CBOE Volatility Index', 'Russell 2000', 'Wilshire 5000']
     }
 
     df_index = pd.DataFrame(index_data)
@@ -63,62 +51,90 @@ def main(db):
     # insert indexes and prices to database
     insert_index(cursor, df_index, db)
 
-def scrape(page, type):
-    # load webpage
-    r=requests.get(page)
+def scrape(page_url: str) -> pd.DataFrame:
+    r = requests.get(page_url, timeout=30)
+    r.raise_for_status()
 
-    # convert to beautiful soup object
     soup = bs(r.content, features="lxml")
+    table = soup.find("table", {"class": "tinytable"})
+    if table is None:
+        raise RuntimeError("Could not find table.tinytable on the page")
 
-    # extract table
-    table = soup.find('table', {'class': 'tinytable'})
+    # headers (visible text)
+    headers = [th.get_text(strip=True).replace("\xa0", " ") for th in table.find_all("th")]
 
-    # extract headers
-    headers = []
-    for th in table.find_all('th'):
-        headers.append(th.text.strip())
-
-    # extract table rows
     rows = []
-    for tr in table.find_all('tr')[1:]:  # Skip the header row
-        cells = tr.find_all('td')
-        row = [cell.text.strip() for cell in cells]
+    
+    filing_idx = headers.index("Filing Date") if "Filing Date" in headers else None
+    
+    for tr in table.find_all("tr")[1:]:
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+
+        # build a dict keyed by header
+        row = {}
+        for i, cell in enumerate(tds):
+            if i >= len(headers):
+                break
+            row[headers[i]] = cell.get_text(strip=True)
+
+        # Extract the Form 4 link from the Filing Date cell (anchor tag)
+        # OpenInsider typically has <td><a href="...">Filing Date</a></td>
+        source_url = None
+        if filing_idx is not None and filing_idx < len(tds):
+            a = tds[filing_idx].find("a", href=True)
+            if a:
+                source_url = urljoin(OPENINSIDER_BASE, a["href"])
+                
+                #normalize SEC http -> https
+                if source_url.startswith("http://www.sec.gov/"):
+                    source_url = source_url.replace("http://www.sec.gov/", "https://www.sec.gov/")
+                    
+        row["Source URL"] = source_url
+        
         rows.append(row)
 
-    # create dataframes
-    df = pd.DataFrame(rows, columns=headers)
+    df = pd.DataFrame(rows)
 
-    # get rid of unicode characters between column names
-    df.columns = df.columns.str.replace('\xa0', ' ')
+    # normalize column names (just in case)
+    df.columns = df.columns.str.replace("\xa0", " ")
 
-    # clean up columns depending on type
-    if type == 'cluster':
-        df = df[['X', 'Filing Date', 'Trade Date', 'Ticker', 'Company Name', 'Industry', 'Ins', 'Trade Type', 'Price', 'Qty', 'Owned', 'ΔOwn', 'Value']]
-    elif type == 'insider':
-        df = df[['X', 'Filing Date', 'Trade Date', 'Ticker', 'Company Name', 'Insider Name', 'Title', 'Trade Type', 'Price', 'Qty', 'Owned', 'ΔOwn', 'Value']]
-    else:
-        logging.error(f"No type specified for scraper function")
-        sys.exit(1)
+    # Keep only the columns you care about (adjust as needed)
+    keep = [
+        "X", "Filing Date", "Trade Date", "Ticker", "Company Name",
+        "Insider Name", "Title", "Trade Type", "Price", "Qty",
+        "Owned", "ΔOwn", "Value", "Source URL"
+    ]
+    df = df[[c for c in keep if c in df.columns]]
 
-    # cast filing and trade dates to datetime
-    df['Filing Date'] = pd.to_datetime(df['Filing Date'], errors='coerce')
-    df['Trade Date'] = pd.to_datetime(df['Trade Date'], errors='coerce')
+    # Cast dates
+    df["Filing Date"] = pd.to_datetime(df["Filing Date"], errors="coerce")
+    df["Trade Date"] = pd.to_datetime(df["Trade Date"], errors="coerce")
 
-    # cast into string for database insertion
-    # will have to be cast back to string for any yFinance queries
-    df['Filing Date'] = df['Filing Date'].dt.strftime('%Y-%m-%d %H:%M:%S.%f')
-    df['Trade Date'] = df['Trade Date'].dt.strftime('%Y-%m-%d')
+    # IMPORTANT: your new schema expects YYYY-MM-DD (length=10)
+    df["Filing Date"] = df["Filing Date"].dt.strftime("%Y-%m-%d")
+    df["Trade Date"] = df["Trade Date"].dt.strftime("%Y-%m-%d")
 
-    #cast quantity to integer and price to float
-    df['Qty'] = df['Qty'].replace(r'[^\d]', '', regex=True).astype(int)
-    df['Price'] = df['Price'].replace(r'[^\d.]', '', regex=True).astype(float)
+    # Qty int, Price float
+    df["Qty"] = df["Qty"].replace(r"[^\d]", "", regex=True)
+    df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").astype("Int64")
 
-    # cast Ins column as integer
-    if type == 'cluster':
-        df['Ins'] = pd.to_numeric(df['Ins'], errors='coerce').fillna(0).astype(int)
-
-    # return dataframe
-    return(df)
+    df["Price"] = df["Price"].replace(r"[^\d.]", "", regex=True)
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    
+    df.columns = (
+        df.columns
+            .str.strip()
+            .str.replace(" ", "_")
+            .str.replace("Δ", "delta", regex=False)
+            .str.lower()
+    )
+    
+    # fix "Trade Type" field to just letter code
+    df["sec_tx_code"] = df["trade_type"].astype("string").str.split(" - ", n=1).str[0]
+    
+    return df
 
 def insert_tickers(cursor, df, db):
     # update database with new tickers
@@ -264,75 +280,7 @@ def get_historical_prices(cursor, new_tickers, db, term):
             with open("scraper.log", "a") as log_file:
                 log_file.write(f'Failed to get historical data for {ticker_symbol}: {e}\n')
             print(f'Failed to get historical data for {ticker_symbol}: {e}')
-
-def insert_cluster(cursor, df, db):
-    # update database with new cluster transactions
-
-    # get existing transactions from database
-    query = "SELECT Filing_Date FROM cluster_data"
-    existing_transactions = pd.read_sql(query, db)
-
-    print(existing_transactions)
-
-    # copy passed dataframe to get desired info for database
-    df_cluster_data = df[['Filing Date', 'Trade Date', 'Ticker', 'Ins', 'Price', 'Qty']].copy()
-    print(df_cluster_data)
-
-    # create dataframe to isolate new tickers
-    merged = pd.merge(df_cluster_data, existing_transactions, left_on='Filing Date', right_on='Filing_Date', how='left', indicator=True)
-
-    new_cluster_data = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
-
-    print(new_cluster_data)
-
-    # get additional information columns added
-    new_cluster_data['Trade Close'] = None
-    new_cluster_data['Trade Low'] = None
-    new_cluster_data['Mkt Buy'] = None
-
-    for index, row in new_cluster_data.iterrows():
-        ticker_symbol = row['Ticker']
-        trade_date = row['Trade Date']
-        price = row['Price']
-
-        try:
-            # get close and low price for transaction
-            trade_close, trade_low = get_closing_price(ticker_symbol, trade_date)
-            print(f'cluster pricing for {ticker_symbol} on {trade_date}:', trade_close, trade_low)
-
-            # check that close and low are > 0, if not mkt_buy = none
-            if trade_low is not None and trade_low > 0:
-                # if price is above 99% of low, mkt_buy = 1, else 0
-                if price > (trade_low * 0.99):
-                    mkt_buy = 1
-                else:
-                    mkt_buy = 0
-            else:
-                mkt_buy = None
-
-            # update fields in dataframe
-            new_cluster_data.at[index, 'Trade Close'] = trade_close
-            new_cluster_data.at[index, 'Trade Low'] = trade_low
-            new_cluster_data.at[index, 'Mkt Buy'] = mkt_buy
-
-        except Exception as e:
-            logging.error(f'Error retrieving or inserting cluster buy for {ticker_symbol}: {e}', exc_info=True)
-
-    # insert new transactions into database
-    for index, row in new_cluster_data.iterrows():
-        cursor.execute('''
-            INSERT OR IGNORE INTO cluster_data (Filing_Date, Trade_Date,
-            Ticker, Ins, Price, Qty, Trade_Close, Trade_Low, Mkt_Buy)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (row['Filing Date'], row['Trade Date'], row['Ticker'], 
-            row['Ins'],row['Price'], row['Qty'], row['Trade Close'],
-            row['Trade Low'], row['Mkt Buy']))
             
-    # comit to database
-    db.commit()
-        
-    print(new_cluster_data)
-
 def insert_insiders(cursor, df, db):
     query = "SELECT Filing_Date FROM insider_data"
     existing_transactions = pd.read_sql(query, db)
@@ -448,11 +396,69 @@ def get_price_info(ticker):
 def connect_db(db_name):
     return sqlite3.connect(db_name)
 
+def setup_logging(name):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    
+    handler = RotatingFileHandler(
+        f"{name}.log",
+        maxBytes=5_000_000,  # 5 MB
+        backupCount=5  # Keep up to 5 log files
+    )
+    
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    )
+    
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    return logger
+
+logger = setup_logging("inside_scrape")
+
 if __name__ == "__main__":
     # connect to database
-    db = connect_db('insider_database.db')
+    db = connect_db('insider_database_v2.db')
+    db.execute('PRAGMA foreign_keys = ON;')
+    
+    cursor = db.cursor()
+    
+    # create run record
+    cursor.execute('''
+                   INSERT INTO runs (job_name, status)
+                   VALUES (?, 'RUNNING')
+                   ''', ('inside_scrape',))
+    run_id = cursor.lastrowid
+    db.commit()
 
     try:
+        logger.info('Starting inside_scrape run_id=%s', run_id)
+        
         main(db)
+        
+        cursor.execute('''
+                       UPDATE runs
+                       SET status = 'SUCCESS', finished_at=datetime('now')
+                       WHERE run_id=?
+                       ''', (run_id,))
+        db.commit()
+        
+        logger.info('Completed inside_scrape run_id=%s', run_id)
+        
+    except Exception as e:
+        logger.exception('Run failed run_id=%s', run_id)
+        
+        cursor.execute('''
+                       UPDATE runs
+                       SET status='FAILED',
+                       finished_at=datetime('now'),
+                       error_message=?
+                       WHERE run_id=?
+                       ''', (str(e), run_id))
+        db.commit()
+        
+        raise
+    
     finally:
         db.close()

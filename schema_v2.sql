@@ -16,7 +16,12 @@ CREATE TABLE IF NOT EXISTS ticker_data (
   currency         TEXT,
   country          TEXT,
   first_seen_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  last_seen_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  last_seen_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  status           TEXT,
+  status_reason    TEXT,
+  last_price_date  TEXT,
+  last_price_attempt_at TEXT,
+  fail_count.      INTEGER DEFAULT 0    
 );
 
 CREATE TABLE IF NOT EXISTS index_data (
