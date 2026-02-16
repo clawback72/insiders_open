@@ -98,9 +98,12 @@ ON insider_data (ticker, filing_date);
 CREATE INDEX IF NOT EXISTS idx_insider_insider_name
 ON insider_data (insider_name);
 
+CREATE INDEX IF NOT EXISTS idx_insider_active_filing_date
+ON insider_data (is_active, filing_date);
+
 -- fast lookup for “what should this amendment supersede?”
 CREATE INDEX IF NOT EXISTS idx_insider_active_natural_key
-ON insider_data (ticker, insider_name, trade_date, sec_tx_code, is_active);
+ON insider_data (is_active, ticker, insider_name, trade_date, sec_tx_code);
 
 
 -- =========================
@@ -151,4 +154,23 @@ CREATE TABLE IF NOT EXISTS corporate_actions (
 
 CREATE INDEX IF NOT EXISTS idx_corp_actions_ticker_date
 ON corporate_actions (ticker, action_date);
+
+CREATE TABLE IF NOT EXISTS ticker_events (
+  event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  old_ticker      TEXT,
+  new_ticker      TEXT,
+  event_date      TEXT NOT NULL CHECK (length(event_date)=10),
+  event_type      TEXT NOT NULL CHECK (event_type IN ('TICKER_CHANGE','NAME_CHANGE')),
+  old_name        TEXT,
+  new_name        TEXT,
+  source          TEXT NOT NULL DEFAULT 'manual',
+  noted_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticker_events_new_ticker_date
+ON ticker_events (new_ticker, event_date);
+
+CREATE INDEX IF NOT EXISTS idx_ticker_events_old_ticker_date
+ON ticker_events (old_ticker, event_date);
+
 

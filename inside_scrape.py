@@ -31,26 +31,30 @@ def main(db):
 
     # send dataframe to insert_tickers to update database with new securities
     tickers_inserted = insert_tickers(cursor, df_insiders, db)
+    
+    logger.info('Tickers insterted=%d', tickers_inserted)
 
     # send dataframe to insert_insiders to update database with new transactions
-    tx_inserted, tx_skipped = insert_insiders(cursor, df_insiders, db)
+    tx_inserted, tx_skipped, tx_deactivated = insert_insiders(cursor, df_insiders, db)
     
     logger.info(
-        'DB updates: Inserted tickers=%d, transactions inserted=%d,  skipped=%d',
-        tickers_inserted, tx_inserted, tx_skipped
+        'Transactions: inserted=%d, skipped=%d,  deactivated=%d',
+        tx_inserted, tx_skipped, tx_deactivated
     )
 
     # create dataframe for insertion of indexes
     index_data = {
-        'Ticker': ['^GSPC', '^DJI', '^IXIC', '^VIX', '^RUT', '^FTW5000'],
-        'Name': ['S&P 500', 'Dow Jones Industrial Average', 'NASDAQ',
+        'ticker': ['^GSPC', '^DJI', '^IXIC', '^VIX', '^RUT', '^FTW5000'],
+        'index_name': ['S&P 500', 'Dow Jones Industrial Average', 'NASDAQ',
                  'CBOE Volatility Index', 'Russell 2000', 'Wilshire 5000']
     }
 
     df_index = pd.DataFrame(index_data)
 
     # insert indexes and prices to database
-    insert_index(cursor, df_index, db)
+    idx_inserted = insert_index(cursor, df_index, db)
+    
+    logger.info('Indexes inserted=%d', idx_inserted)
 
 def scrape(page_url: str) -> pd.DataFrame:
     r = requests.get(page_url, timeout=30)
@@ -224,210 +228,245 @@ def insert_tickers(cursor, df, db) -> int:
     return len(new_df)
 
 def insert_index(cursor, df, db):
-    # update database with new tickers
+    existing = pd.read_sql("SELECT ticker FROM index_data", db)
+    existing_set = set(existing["ticker"].tolist())
 
-    # get existing tickers from database
-    query = "SELECT Ticker, Index_Name FROM index_data"
-    existing_tickers = pd.read_sql(query, db)
+    df_idx = df[["ticker", "index_name"]].drop_duplicates().copy()
+    new_idx = df_idx[~df_idx["ticker"].isin(existing_set)].copy()
 
-    # copy passed dataframe to get tickers and Index name
-    df_ticker_data = df[['Ticker', 'Name']].copy().drop_duplicates()
+    if new_idx.empty:
+        return 0
 
-    # create dataframe to isolate new tickers
-    merged = pd.merge(df_ticker_data, existing_tickers, on=['Ticker'], how='left', indicator=True)
+    new_idx["short_name"] = None
 
-    new_tickers = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
-
-    # get additional information columns added
-    new_tickers['Short Name'] = None
-
-    for index, row in new_tickers.iterrows():
-        ticker_symbol = row['Ticker']
+    for i, row in new_idx.iterrows():
+        t = row["ticker"]
         try:
-            stock = yf.Ticker(ticker_symbol)
-            info = stock.info
-
-            # update fields in dataframe
-            new_tickers.at[index, 'Short Name'] = info.get('shortName', None)
-        
+            info = yf.Ticker(t).info or {}
+            new_idx.at[i, "short_name"] = info.get("shortName")
         except Exception as e:
-            logging.error(f'Error retrieving information data for {ticker_symbol}: {e}', exc_info=True)
+            logger.warning("Index info failed for %s: %s", t, e, exc_info=True)
 
-    # insert into database
-    for index, row in new_tickers.iterrows():
-        cursor.execute('''
-            INSERT OR IGNORE INTO index_data (Ticker, Index_Name, Short_Name
-            ) VALUES (?, ?, ?)
-            ''', (row['Ticker'], row['Name'], row['Short Name']))
-        
+    for _, row in new_idx.iterrows():
+        cursor.execute(
+            """
+            INSERT INTO index_data (ticker, index_name, short_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+              index_name = excluded.index_name,
+              short_name = excluded.short_name
+            """,
+            (row["ticker"], row["index_name"], row["short_name"]),
+        )
+
     db.commit()
+    return len(new_idx)
 
-    # get historical pricing for new tickers
-    get_historical_prices(cursor, new_tickers, db, 30)
+def _none_if_na(x):
+    # Handles pandas <NA>, NaN, None
+    if x is None:
+        return None
+    try:
+        # NaN check: NaN != NaN
+        if x != x:
+            return None
+    except Exception:
+        pass
+    return x
 
-def get_historical_prices(cursor, new_tickers, db, term):
-    # define cutoff time so we don't import today's close prices early (prior to 4:00 PM EST)
-    # otherwise, early pre-close prices may be inserted to database and will be painful to correct
-    est = pytz.timezone('US/Eastern')
-    # get current time in EST
-    current_time_est = datetime.now(est)
-    # define cutoff time for getting today's prices after 4:00 PM EST
-    cutoff_time_est = current_time_est.replace(hour=16, minute=10, second=0, microsecond=0)
-   
-    if current_time_est < cutoff_time_est:
-        end_date = datetime.today().strftime('%Y-%m-%d')
-    else:
-        end_date = (datetime.today() + timedelta(days=1)).strftime('%Y-%m-%d')
-        
-    start_date = (datetime.today() - timedelta(days=term)).strftime('%Y-%m-%d')
+def _to_float(x):
+    x = _none_if_na(x)
+    return None if x is None else float(x)
 
-    # iterate through each new ticker
-    for index, row in new_tickers.iterrows():
-        ticker_symbol = row['Ticker']
+def _to_int(x):
+    x = _none_if_na(x)
+    return None if x is None else int(x)
 
-        try:
-            # get historical pricing data
-            ticker = yf.Ticker(ticker_symbol)
-            history = ticker.history(start=start_date, end=end_date)
-            
-            # print(history)
+def _tx_id(
+    *,
+    source_url: str | None,
+    filing_date: str | None,
+    trade_date: str | None,
+    ticker: str | None,
+    insider_name: str | None,
+    title: str | None,
+    trade_type: str | None,
+    price: float | None,
+    qty: int | None,
+    x_flags: str | None,
+) -> str:
+    """
+    Stable transaction_id.
+    Includes source_url (strong anchor) + key transaction fields to avoid collisions
+    across multiple rows tied to the same filing.
+    """
+    parts = [
+        source_url or "",
+        filing_date or "",
+        trade_date or "",
+        ticker or "",
+        insider_name or "",
+        title or "",
+        trade_type or "",
+        f"{price}" if price is not None else "",
+        f"{qty}" if qty is not None else "",
+        x_flags or "",
+    ]
+    canonical = "|".join(parts)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-            # check if data is returned
-            if not history.empty:
-                for date, data in history.iterrows():
-                    trade_date = date.strftime('%Y-%m-%d')
-                    open_price = round(data['Open'], 3)
-                    close_price = round(data['Close'], 3)
-                    
-                    # print each price as returned - comment out for production
-                    print(ticker_symbol, trade_date, open_price, close_price)
-
-                    # insert ticker data into database
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO pricing_data (Ticker, Trade_Date, Open, Close)
-                        VALUES (?, ?, ?, ?)
-                    ''', (ticker_symbol, trade_date, open_price, close_price))
-
-            # commit ticker data to database
-            db.commit()
-
-        except Exception as e:
-            # log errors for failed pulls
-            with open("scraper.log", "a") as log_file:
-                log_file.write(f'Failed to get historical data for {ticker_symbol}: {e}\n')
-            print(f'Failed to get historical data for {ticker_symbol}: {e}')
-            
 def insert_insiders(cursor, df, db):
-    query = "SELECT Filing_Date FROM insider_data"
-    existing_transactions = pd.read_sql(query, db)
+    """
+    Insert insider transactions into insider_data (v2 schema).
+    Returns (inserted_count, skipped_count, deactivated_count).
+    """
 
-    # copy passed data frame to get desired info for database
-    df_insider_data = df[['X', 'Filing Date', 'Trade Date', 'Ticker', 'Insider Name', 'Title', 'Price', 'Qty']].copy()
-    print(df_insider_data)
+    inserted = 0
+    skipped = 0
+    deactivated_total = 0
 
-    # create dataframe to isolate new tickers
-    merged = pd.merge(df_insider_data, existing_transactions, left_on='Filing Date', right_on='Filing_Date', how='left', indicator=True)
-    
-    new_insider_data = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+    # basic guardrails
+    required = ["ticker", "filing_date", "source_url"]
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"insert_insiders: missing required column '{col}'")
 
-    print(new_insider_data)
+    # iterate records
+    for rec in df.to_dict(orient="records"):
+        ticker = _none_if_na(rec.get("ticker"))
+        filing_date = _none_if_na(rec.get("filing_date"))
+        trade_date = _none_if_na(rec.get("trade_date"))
+        insider_name = _none_if_na(rec.get("insider_name"))
+        title = _none_if_na(rec.get("title"))
+        trade_type = _none_if_na(rec.get("trade_type"))
+        sec_tx_code = _none_if_na(rec.get("sec_tx_code"))
+        source_url = _none_if_na(rec.get("source_url"))
 
-    # add additional columns to df
-    new_insider_data['Trade Close'] = None
-    new_insider_data['Trade Low'] = None
-    new_insider_data['Mkt Buy'] = None
-    new_insider_data['52Wk Low'] = None
-    new_insider_data['52Wk High'] = None
-    new_insider_data['50Day Avg'] = None
-    new_insider_data['200Day Avg'] = None
+        # your scraper column is 'x' (formerly X)
+        x_flags = _none_if_na(rec.get("x"))
 
-    for index, row in new_insider_data.iterrows():
-        ticker_symbol = row['Ticker']
-        trade_date = row['Trade Date']
-        price = row['Price']
+        price = _to_float(rec.get("price"))
+        qty = _to_int(rec.get("qty"))
 
-        try:
-            # get close and low price for transaction
-            trade_close, trade_low = get_closing_price(ticker_symbol, trade_date)
-            print(f'individual pricing for {ticker_symbol} on {trade_date}:', trade_close, trade_low)
-            
-            low_52, high_52, avg_50, avg_200 = get_price_info(ticker_symbol)
-            print(f'52 Day Low:{low_52}  52 Day High:{high_52}  50 Day Avg:{avg_50} 200 Day Avg:{avg_200}')
-            
-            # check that close and low are > 0, if not mkt_buy = none
-            if trade_low is not None and trade_low > 0:
-                # if price is above 99% of low, mkt_buy = 1, else 0
-                if price > (trade_low * 0.99):
-                    mkt_buy = 1
-                else:
-                    mkt_buy = 0
-            else:
-                mkt_buy = None
+        # compute value when possible
+        value = None
+        if price is not None and qty is not None:
+            value = price * qty
 
-            # update fields in dataframe
-            new_insider_data.at[index, 'Trade Close'] = trade_close
-            new_insider_data.at[index, 'Trade Low'] = trade_low
-            new_insider_data.at[index, 'Mkt Buy'] = mkt_buy
-            new_insider_data.at[index, '52Wk Low'] = low_52
-            new_insider_data.at[index, '52Wk High'] = high_52
-            new_insider_data.at[index, '50Day Avg'] = avg_50
-            new_insider_data.at[index, '200Day Avg'] = avg_200
+        # simple classification rules (refine later if you parse SEC XML)
+        is_open_market = None
+        classification = "UNKNOWN"
+        if trade_type == "P - Purchase":
+            is_open_market = 1
+            classification = "OPEN_MARKET"
+        elif trade_type == "S - Sale":
+            is_open_market = 1
+            classification = "OPEN_MARKET"
+        elif trade_type == "S - Sale+OE":
+            is_open_market = 0
+            classification = "OPTION_EXERCISE"
+        elif trade_type == "F - Tax":
+            is_open_market = 0
+            classification = "OTHER"
+        elif trade_type is None:
+            is_open_market = None
+            classification = "UNKNOWN"
+        else:
+            # unknown label, keep but mark OTHER/UNKNOWN
+            is_open_market = None
+            classification = "OTHER"
 
-        except Exception as e:
-            logging.error(f'Error retrieving individual data for {ticker_symbol}: {e}', exc_info=True)
+        transaction_id = _tx_id(
+            source_url=source_url,
+            filing_date=filing_date,
+            trade_date=trade_date,
+            ticker=ticker,
+            insider_name=insider_name,
+            title=title,
+            trade_type=trade_type,
+            price=price,
+            qty=qty,
+            x_flags=x_flags,
+        )
 
-    # insert new transactions into database
-    for index, row in new_insider_data.iterrows():
-        cursor.execute('''
-            INSERT OR IGNORE INTO insider_data (X, Filing_Date, Trade_Date,
-            Ticker, Insider_Name, Title, Price, Qty, Trade_Close, Trade_Low,
-            Mkt_Buy, Low_52, High_52, Avg_50, Avg_200) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (row['X'], row['Filing Date'], row['Trade Date'], row['Ticker'], 
-            row['Insider Name'], row['Title'], row['Price'], row['Qty'], 
-            row['Trade Close'], row['Trade Low'], row['Mkt Buy'],
-            row['52Wk Low'], row['52Wk High'], row['50Day Avg'], 
-            row['200Day Avg']))
-        
-    # commit to database
+        cursor.execute(
+            """
+            INSERT INTO insider_data (
+                transaction_id,
+                filing_date,
+                trade_date,
+                ticker,
+                insider_name,
+                title,
+                trade_type,
+                sec_tx_code,
+                x_flags,
+                is_open_market,
+                classification,
+                price,
+                qty,
+                value,
+                source_url,
+                is_active
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(transaction_id) DO NOTHING
+            """,
+            (
+                transaction_id,
+                filing_date,
+                trade_date,
+                ticker,
+                insider_name,
+                title,
+                trade_type,
+                sec_tx_code,
+                x_flags,
+                is_open_market,
+                classification,
+                price,
+                qty,
+                value,
+                source_url,
+            ),
+        )
+
+        if cursor.rowcount == 1:
+            inserted += 1
+
+            # Amendment handling: if x_flags contains 'A', deactivate matching prior active rows
+            is_amendment = isinstance(x_flags, str) and ("A" in x_flags)
+            if is_amendment:
+                # Natural key: ticker + insider_name + trade_date + sec_tx_code
+                cursor.execute(
+                    """
+                    UPDATE insider_data
+                    SET is_active = 0,
+                        superseded_by = ?,
+                        superseded_at = datetime('now')
+                    WHERE is_active = 1
+                      AND ticker = ?
+                      AND (insider_name IS ?)
+                      AND (trade_date IS ?)
+                      AND (sec_tx_code IS ?)
+                      AND transaction_id <> ?
+                    """,
+                    (transaction_id, ticker, insider_name, trade_date, sec_tx_code, transaction_id),
+                )
+                deactivated = cursor.rowcount
+                deactivated_total += deactivated
+
+                # if deactivated != 1, it's not fatal, but it’s worth logging
+                if deactivated != 1:
+                    logger.warning(
+                        "Amendment inserted (%s) deactivated %d prior rows for key (%s, %s, %s, %s)",
+                        transaction_id, deactivated, ticker, insider_name, trade_date, sec_tx_code
+                    )
+        else:
+            skipped += 1
+
     db.commit()
-
-    print(new_insider_data)                        
-
-def get_closing_price(ticker, trade_date):
-    # format trade date
-    trade_date = pd.to_datetime(trade_date).strftime('%Y-%m-%d')
-
-    # yFinance wont work with just one date or using the same dates
-    # so create different start and end dates for our query then pull the desired date's price 
-    start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-    end_date = (pd.to_datetime(trade_date) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-
-    stock = yf.Ticker(ticker)
-    history = stock.history(start=start_date, end=end_date)
-    # print(trade_date, ticker, history.loc[trade_date]['Close'], history.loc[trade_date]['Low')
-    
-    # Check if the date is in the DataFrame
-    if not history.empty:
-        close_price = history.loc[trade_date]['Close']
-        low_price = history.loc[trade_date]['Low']
-        return round(close_price, 3), round(low_price, 3)
-    else:
-        return None, None  # case where the date or ticker data is not available
-
-def get_price_info(ticker):
-    # get and return 52 week low and high prices and moving 50 and 200 day average prices
-    
-    # get stock info
-    stock = yf.Ticker(ticker)
-    stock_info = stock.info
-
-    # get desired info and return
-    low_52 = stock_info.get('fiftyTwoWeekLow')
-    high_52 = stock_info.get('fiftyTwoWeekHigh')
-    avg_50 = stock_info.get('fiftyDayAverage')
-    avg_200 = stock_info.get('twoHundredDayAverage')
-
-    return round(low_52, 3), round(high_52, 3), round(avg_50, 3), round(avg_200, 3)
+    return inserted, skipped, deactivated_total
 
 def connect_db(db_name):
     return sqlite3.connect(db_name)
@@ -435,6 +474,9 @@ def connect_db(db_name):
 def setup_logging(name):
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
+    
+    if logger.handlers:
+        return logger
     
     handler = RotatingFileHandler(
         f"{name}.log",
