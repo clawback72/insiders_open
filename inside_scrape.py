@@ -136,56 +136,91 @@ def scrape(page_url: str) -> pd.DataFrame:
     
     return df
 
-def insert_tickers(cursor, df, db):
-    # update database with new tickers
+def insert_tickers(cursor, df, db) -> int:
+    """
+    Insert new tickers into ticker_data and update last_seen_at for all tickers present in df.
+    Returns count of newly inserted tickers.
+    """
 
-    # get existing tickers from database
-    query = "SELECT Ticker, Company_Name FROM ticker_data"
-    existing_tickers = pd.read_sql(query, db)
+    # unique tickers seen in this scrape
+    df_tickers = (
+        df[["ticker", "company_name"]]
+        .dropna(subset=["ticker"])
+        .drop_duplicates()
+        .copy()
+    )
 
-    # copy passed dataframe to get tickers and company name
-    df_ticker_data = df[['Ticker', 'Company Name']].copy().drop_duplicates()
+    # existing tickers set
+    existing = pd.read_sql("SELECT ticker FROM ticker_data", db)["ticker"].tolist()
+    existing_set = set(existing)
 
-    # create dataframe to isolate new tickers
-    merged = pd.merge(df_ticker_data, existing_tickers, on=['Ticker'], how='left', indicator=True)
+    # split into new vs seen
+    new_df = df_tickers[~df_tickers["ticker"].isin(existing_set)].copy()
 
-    new_tickers = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+    # Always bump last_seen_at for tickers present in scrape
+    # (do this once, not row-by-row if you can)
+    for t in df_tickers["ticker"].tolist():
+        cursor.execute(
+            "UPDATE ticker_data SET last_seen_at=datetime('now') WHERE ticker=?",
+            (t,)
+        )
 
-    # get additional information columns added
-    new_tickers['Short Name'] = None
-    new_tickers['Sector'] = None
-    new_tickers['Industry'] = None
-    new_tickers['Exchange'] = None
-    new_tickers['Website'] = None
+    # If no new tickers, commit last_seen_at updates and return
+    if new_df.empty:
+        db.commit()
+        return 0
 
-    for index, row in new_tickers.iterrows():
-        ticker_symbol = row['Ticker']
+    # Enrich new tickers with yfinance info
+    # Initialize schema columns
+    new_df["short_name"] = None
+    new_df["sector"] = None
+    new_df["industry"] = None
+    new_df["exchange"] = None
+    new_df["website"] = None
+    new_df["cik"] = None
+    new_df["currency"] = None
+    new_df["country"] = None
+
+    for idx, row in new_df.iterrows():
+        ticker_symbol = row["ticker"]
         try:
-            stock = yf.Ticker(ticker_symbol)
-            info = stock.info
-
-            # update fields in dataframe
-            new_tickers.at[index, 'Short Name'] = info.get('shortName', None)
-            new_tickers.at[index, 'Sector'] = info.get('sector', None)
-            new_tickers.at[index, 'Industry'] = info.get('industry', None)
-            new_tickers.at[index, 'Exchange'] = info.get('exchange', None)
-            new_tickers.at[index, 'Website'] = info.get('website', None)
-        
+            info = yf.Ticker(ticker_symbol).info or {}
+            new_df.at[idx, "short_name"] = info.get("shortName")
+            new_df.at[idx, "sector"] = info.get("sector")
+            new_df.at[idx, "industry"] = info.get("industry")
+            new_df.at[idx, "exchange"] = info.get("exchange")
+            new_df.at[idx, "website"] = info.get("website")
+            new_df.at[idx, "cik"] = info.get("cik")
+            new_df.at[idx, "currency"] = info.get("currency")
+            new_df.at[idx, "country"] = info.get("country")
         except Exception as e:
-            logging.error(f'Error retrieving information data for {ticker_symbol}: {e}', exc_info=True)
+            logger.warning("yfinance info failed for %s: %s", ticker_symbol, e)
 
-    # insert into database
-    for index, row in new_tickers.iterrows():
-        cursor.execute('''
-            INSERT OR IGNORE INTO ticker_data (Ticker, Company_Name, Short_Name, Sector,
-            Industry, Exchange, Website) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (row['Ticker'], row['Company Name'], row['Short Name'], row['Sector']
-                  , row['Industry'], row['Exchange'], row['Website']))
-        
+    # Insert new tickers (first_seen_at/last_seen_at handled by defaults)
+    for _, row in new_df.iterrows():
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO ticker_data
+            (ticker, company_name, short_name, sector, industry, exchange, website, cik, currency, country)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["ticker"],
+                row["company_name"],
+                row["short_name"],
+                row["sector"],
+                row["industry"],
+                row["exchange"],
+                row["website"],
+                row["cik"],
+                row["currency"],
+                row["country"],
+            ),
+        )
+
     db.commit()
 
-    # get historical pricing for new tickers
-    get_historical_prices(cursor, new_tickers, db, 30)
+    return len(new_df)
 
 def insert_index(cursor, df, db):
     # update database with new tickers
