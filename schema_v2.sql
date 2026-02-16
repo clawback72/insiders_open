@@ -64,26 +64,30 @@ CREATE TABLE IF NOT EXISTS insider_data (
   insider_name     TEXT,
   title            TEXT,
 
-  -- transaction classification / codes
-  sec_tx_code      TEXT,      -- P/S/A etc when you can map it
-  x_flags          TEXT,      -- raw flags like 'DM'
+  -- raw label + normalized code
+  trade_type       TEXT,      -- e.g. 'S - Sale+OE'
+  sec_tx_code      TEXT,      -- e.g. 'S', 'P', 'F'
+  x_flags          TEXT,      -- raw flags like 'DM', 'A', etc.
+
   is_open_market   INTEGER CHECK (is_open_market IN (0,1)),
-  classification   TEXT CHECK (classification IN ('OPEN_MARKET','OPTION_EXERCISE','OTHER','UNKNOWN')),      -- e.g. OPEN_MARKET / OPTION_EXERCISE / OTHER / UNKNOWN
+  classification   TEXT CHECK (classification IN ('OPEN_MARKET','OPTION_EXERCISE','OTHER','UNKNOWN')),
 
   price            REAL CHECK (price IS NULL OR price >= 0),
   qty              INTEGER CHECK (qty IS NULL OR qty >= 0),
   value            REAL,
 
-  -- technical snapshot (optional)
-  low_52           REAL,
-  high_52          REAL,
-  avg_50           REAL,
-  avg_200          REAL,
+  -- amendment/versioning support
+  is_active        INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+  superseded_by    TEXT,
+  superseded_at    TEXT,
 
   source_url       TEXT NOT NULL,
 
   FOREIGN KEY (ticker) REFERENCES ticker_data (ticker)
 );
+
+CREATE INDEX IF NOT EXISTS idx_insider_active
+ON insider_data (is_active);
 
 CREATE INDEX IF NOT EXISTS idx_insider_ticker_trade_date
 ON insider_data (ticker, trade_date);
@@ -94,10 +98,10 @@ ON insider_data (ticker, filing_date);
 CREATE INDEX IF NOT EXISTS idx_insider_insider_name
 ON insider_data (insider_name);
 
--- This helps prevent accidental duplicates if your hash ever changes:
--- adjust columns to match your "natural key" choice.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_insider_natural_key
-ON insider_data (source_url, trade_date, ticker, insider_name, price, qty);
+-- fast lookup for “what should this amendment supersede?”
+CREATE INDEX IF NOT EXISTS idx_insider_active_natural_key
+ON insider_data (ticker, insider_name, trade_date, sec_tx_code, is_active);
+
 
 -- =========================
 -- Daily prices (OHLCV + adj_close)

@@ -6,6 +6,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import pytz
 import sys
+import hashlib
 from bs4 import BeautifulSoup as bs
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
