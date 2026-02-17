@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS ticker_data (
   status_reason    TEXT,
   last_price_date  TEXT,
   last_price_attempt_at TEXT,
-  fail_count.      INTEGER DEFAULT 0    
+  fail_count       INTEGER DEFAULT 0    
 );
 
 CREATE TABLE IF NOT EXISTS index_data (
