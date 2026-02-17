@@ -51,13 +51,18 @@ def main(db: sqlite3.Connection) -> None:
             cursor, df_equities, db, term_days=5, ticker_col="ticker", include_actions=True
         )
 
-    df_indexes = pd.read_sql("SELECT DISTINCT ticker FROM index_data;", db)
+    # Pull indexes with names so we can store a friendly placeholder in ticker_data
+    df_indexes = pd.read_sql("SELECT ticker, index_name FROM index_data;", db)
     if df_indexes.empty:
         logger.info("No indexes found in index_data.")
         rows_ix = 0
     else:
+        ensured = ensure_tickers_exist(cursor, df_indexes, ticker_col="ticker", name_col="index_name")
+        db.commit()
+        logger.info("Ensured %d index tickers exist in ticker_data (FK safety).", ensured)
+
         rows_ix = get_historical_prices_v2(
-            cursor, df_indexes, db, term_days=5, ticker_col="ticker", include_actions=False
+            cursor, df_indexes[["ticker"]], db, term_days=5, ticker_col="ticker", include_actions=False
         )
 
     logger.info("Price job complete: equities_rows=%d index_rows=%d", rows_eq, rows_ix)
@@ -296,6 +301,30 @@ def _upsert_corporate_actions(cursor, tickers: list[str], *, source: str = "yaho
             """,
             div_rows,
         )
+        
+def ensure_tickers_exist(cursor, df_symbols: pd.DataFrame, *, ticker_col="ticker", name_col=None) -> None:
+    """
+    Insert placeholder rows into ticker_data so FK constraints for pricing_data pass.
+    Optionally uses a name_col (e.g. index_name) for company_name/short_name.
+    """
+    rows = []
+    for _, r in df_symbols.iterrows():
+        t = str(r[ticker_col]).strip()
+        if not t:
+            continue
+        name = None
+        if name_col and name_col in df_symbols.columns:
+            name = r[name_col]
+        rows.append((t, name, name))
+
+    cursor.executemany(
+        """
+        INSERT OR IGNORE INTO ticker_data (ticker, company_name, short_name)
+        VALUES (?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
 
 def connect_db(db_name: str) -> sqlite3.Connection:
     db = sqlite3.connect(db_name)
