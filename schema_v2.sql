@@ -20,8 +20,7 @@ CREATE TABLE IF NOT EXISTS ticker_data (
   status           TEXT,
   status_reason    TEXT,
   last_price_date  TEXT,
-  last_price_attempt_at TEXT,
-  fail_count       INTEGER DEFAULT 0    
+  last_price_attempt_at TEXT 
 );
 
 CREATE TABLE IF NOT EXISTS index_data (
@@ -173,4 +172,37 @@ ON ticker_events (new_ticker, event_date);
 CREATE INDEX IF NOT EXISTS idx_ticker_events_old_ticker_date
 ON ticker_events (old_ticker, event_date);
 
+-- =========================
+-- Ticker health / exclusions
+-- =========================
 
+CREATE TABLE IF NOT EXISTS ticker_failures (
+  ticker         TEXT NOT NULL,
+  job_name       TEXT NOT NULL,                 -- 'price' / 'inside_scrape' etc
+  failure_date   TEXT NOT NULL DEFAULT (date('now')),
+  reason         TEXT,
+  error_class    TEXT,
+  error_message  TEXT,
+  first_seen_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  fail_count     INTEGER NOT NULL DEFAULT 1,
+
+  PRIMARY KEY (ticker, job_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticker_failures_last_seen
+ON ticker_failures (job_name, last_seen_at);
+
+CREATE TABLE IF NOT EXISTS ticker_exclusions (
+  ticker        TEXT PRIMARY KEY,
+  status        TEXT NOT NULL DEFAULT 'EXCLUDED'
+                CHECK (status IN ('EXCLUDED','DELISTED','NO_DATA','BAD_TICKER','MANUAL','TEMP')),
+  reason        TEXT,
+  source        TEXT NOT NULL DEFAULT 'system',
+  excluded_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at    TEXT,                            -- optional for TEMP excludes
+  is_active     INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticker_exclusions_active
+ON ticker_exclusions (is_active, status);

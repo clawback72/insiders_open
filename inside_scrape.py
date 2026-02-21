@@ -16,45 +16,77 @@ SEC_HTTP = "http://www.sec.gov/"
 SEC_HTTPS = "https://www.sec.gov/"
 
 def main(db):
-
-    # set cursor
     cursor = db.cursor()
 
-    # define webpage
-    
-    insider_page_url = 'http://openinsider.com/screener?s=&o=&pl=&ph=&ll=&lh=&fd=730&fdr=&td=0&tdr=&fdlyl=&fdlyh=&daysago=&xp=1&xs=1&vl=&vh=&ocl=&och=&sic1=-1&sicl=100&sich=9999&grp=0&nfl=&nfh=&nil=&nih=&nol=&noh=&v2l=&v2h=&oc2l=&oc2h=&sortcol=0&cnt=500&page=1'
-
-    # create dataframe for insider transactions
-    df_insiders = scrape(insider_page_url)
-    logger.info('Scraped %d insider rows', len(df_insiders))
-    logger.debug('Head:\n%s', df_insiders.head().to_string())
-
-    # send dataframe to insert_tickers to update database with new securities
-    tickers_inserted = insert_tickers(cursor, df_insiders, db)
-    
-    logger.info('Tickers insterted=%d', tickers_inserted)
-
-    # send dataframe to insert_insiders to update database with new transactions
-    tx_inserted, tx_skipped, tx_deactivated = insert_insiders(cursor, df_insiders, db)
-    
-    logger.info(
-        'Transactions: inserted=%d, skipped=%d,  deactivated=%d',
-        tx_inserted, tx_skipped, tx_deactivated
+    insider_page_url = (
+        "http://openinsider.com/screener?s=&o=&pl=&ph=&ll=&lh=&fd=730&fdr=&td=0&tdr=&"
+        "fdlyl=&fdlyh=&daysago=&xp=1&xs=1&vl=&vh=&ocl=&och=&sic1=-1&sicl=100&sich=9999&"
+        "grp=0&nfl=&nfh=&nil=&nih=&nol=&noh=&v2l=&v2h=&oc2l=&oc2h=&sortcol=0&cnt=500&page=1"
     )
 
-    # create dataframe for insertion of indexes
-    index_data = {
-        'ticker': ['^GSPC', '^DJI', '^IXIC', '^VIX', '^RUT', '^FTW5000'],
-        'index_name': ['S&P 500', 'Dow Jones Industrial Average', 'NASDAQ',
-                 'CBOE Volatility Index', 'Russell 2000', 'Wilshire 5000']
-    }
+    run_id = start_run(cursor, "inside_scrape")
+    db.commit()  # important: persist RUNNING row immediately
 
-    df_index = pd.DataFrame(index_data)
+    # Optional “before” metrics (handy for sanity checks, but don’t rely on for rows_inserted)
+    before_ins = _scalar(db, "SELECT COUNT(*) FROM insider_data", default=0)
+    before_tkr = _scalar(db, "SELECT COUNT(*) FROM ticker_data", default=0)
 
-    # insert indexes and prices to database
-    idx_inserted = insert_index(cursor, df_index, db)
-    
-    logger.info('Indexes inserted=%d', idx_inserted)
+    tickers_inserted = 0
+    tx_inserted = 0
+    tx_skipped = 0
+    tx_deactivated = 0
+    idx_inserted = 0
+
+    try:
+        df_insiders = scrape(insider_page_url)
+        logger.info("Scraped %d insider rows", len(df_insiders))
+        logger.debug("Head:\n%s", df_insiders.head().to_string())
+
+        tickers_inserted = insert_tickers(cursor, df_insiders, db)
+        logger.info("Tickers inserted=%d", tickers_inserted)
+
+        tx_inserted, tx_skipped, tx_deactivated = insert_insiders(cursor, df_insiders, db)
+        logger.info(
+            "Transactions: inserted=%d, skipped=%d, deactivated=%d",
+            tx_inserted, tx_skipped, tx_deactivated,
+        )
+
+        index_data = {
+            "ticker": ["^GSPC", "^DJI", "^IXIC", "^VIX", "^RUT", "^FTW5000"],
+            "index_name": [
+                "S&P 500",
+                "Dow Jones Industrial Average",
+                "NASDAQ",
+                "CBOE Volatility Index",
+                "Russell 2000",
+                "Wilshire 5000",
+            ],
+        }
+        df_index = pd.DataFrame(index_data)
+
+        idx_inserted = insert_index(cursor, df_index, db)
+        logger.info("Indexes inserted=%d", idx_inserted)
+
+        # Prefer your “known inserted counts” over table deltas
+        rows_inserted = int(tickers_inserted) + int(tx_inserted) + int(idx_inserted)
+
+        # Optional after-metrics for debugging
+        after_ins = _scalar(db, "SELECT COUNT(*) FROM insider_data", default=0)
+        after_tkr = _scalar(db, "SELECT COUNT(*) FROM ticker_data", default=0)
+        logger.info(
+            "Counts: insider_data %d→%d, ticker_data %d→%d",
+            before_ins, after_ins, before_tkr, after_tkr,
+        )
+
+        finish_run(cursor, run_id, status="SUCCESS", rows_inserted=rows_inserted)
+        db.commit()
+
+    except Exception as e:
+        # Always record the failure in runs
+        finish_run(cursor, run_id, status="FAILED", error_message=str(e))
+        db.commit()
+        logger.exception("inside_scrape failed run_id=%s", run_id)
+        raise
 
 def scrape(page_url: str) -> pd.DataFrame:
     r = requests.get(page_url, timeout=30)
@@ -468,6 +500,31 @@ def insert_insiders(cursor, df, db):
     db.commit()
     return inserted, skipped, deactivated_total
 
+def _scalar(db, sql, params=(), default=None):
+    row = db.execute(sql, params).fetchone()
+    return row[0] if row and row[0] is not None else default
+
+def start_run(cursor, job_name: str) -> int:
+    cursor.execute(
+        "INSERT INTO runs (job_name, status, started_at) VALUES (?, 'RUNNING', datetime('now'))",
+        (job_name,),
+    )
+    return cursor.lastrowid
+
+def finish_run(cursor, run_id: int, *, status: str, rows_inserted: int = 0, rows_updated: int = 0, error_message: str | None = None) -> None:
+    cursor.execute(
+        """
+        UPDATE runs
+        SET finished_at = datetime('now'),
+            status = ?,
+            rows_inserted = ?,
+            rows_updated = ?,
+            error_message = ?
+        WHERE run_id = ?
+        """,
+        (status, rows_inserted, rows_updated, error_message, run_id),
+    )
+
 def connect_db(db_name):
     return sqlite3.connect(db_name)
 
@@ -499,44 +556,7 @@ if __name__ == "__main__":
     # connect to database
     db = connect_db('insider_database_v2.db')
     db.execute('PRAGMA foreign_keys = ON;')
-    
-    cursor = db.cursor()
-    
-    # create run record
-    cursor.execute('''
-                   INSERT INTO runs (job_name, status)
-                   VALUES (?, 'RUNNING')
-                   ''', ('inside_scrape',))
-    run_id = cursor.lastrowid
-    db.commit()
-
     try:
-        logger.info('Starting inside_scrape run_id=%s', run_id)
-        
         main(db)
-        
-        cursor.execute('''
-                       UPDATE runs
-                       SET status = 'SUCCESS', finished_at=datetime('now')
-                       WHERE run_id=?
-                       ''', (run_id,))
-        db.commit()
-        
-        logger.info('Completed inside_scrape run_id=%s', run_id)
-        
-    except Exception as e:
-        logger.exception('Run failed run_id=%s', run_id)
-        
-        cursor.execute('''
-                       UPDATE runs
-                       SET status='FAILED',
-                       finished_at=datetime('now'),
-                       error_message=?
-                       WHERE run_id=?
-                       ''', (str(e), run_id))
-        db.commit()
-        
-        raise
-    
     finally:
         db.close()
