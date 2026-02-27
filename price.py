@@ -159,12 +159,6 @@ def _upsert_ticker_failure(
             (ticker, reason),
         )
 
-    
-    # check fail_count from ticker and exclude if failure is greater than 3
-    row = cursor.execute(
-        "SELECT fail_count FROM ticker_failures WHERE ticker=? AND job_name=?",(ticker, job_name),
-    ).fetchone()
-
 def evaluate_ticker_health(cursor, *, job_name: str, threshold: int = 3) -> None:
     """
     After a pricing run completes, decide which tickers should be excluded.
@@ -262,46 +256,46 @@ def record_price_success(cursor: sqlite3.Cursor, ticker: str, last_date: str | N
     )
 
 
-def record_price_failure(
-    cursor: sqlite3.Cursor,
-    ticker: str,
-    *,
-    reason: str,
-    exc: Exception | None = None,
-) -> None:
-    err_class = type(exc).__name__ if exc else None
-    err_msg = str(exc)[:500] if exc else None
+# def record_price_failure(
+#     cursor: sqlite3.Cursor,
+#     ticker: str,
+#     *,
+#     reason: str,
+#     exc: Exception | None = None,
+# ) -> None:
+#     err_class = type(exc).__name__ if exc else None
+#     err_msg = str(exc)[:500] if exc else None
 
-    # ticker_failures upsert
-    cursor.execute(
-        """
-        INSERT INTO ticker_failures (
-            ticker, job_name, failure_date, reason, error_class, error_message,
-            first_seen_at, last_seen_at, fail_count
-        )
-        VALUES (?, 'price', date('now'), ?, ?, ?, datetime('now'), datetime('now'), 1)
-        ON CONFLICT(ticker, job_name) DO UPDATE SET
-            failure_date = date('now'),
-            reason = excluded.reason,
-            error_class = excluded.error_class,
-            error_message = excluded.error_message,
-            last_seen_at = datetime('now'),
-            fail_count = ticker_failures.fail_count + 1
-        """,
-        (ticker, reason, err_class, err_msg),
-    )
-
-    # ticker_data health fields
-    cursor.execute(
-        """
-        UPDATE ticker_data
-           SET last_price_attempt_at = datetime('now'),
-               status = COALESCE(status, 'WATCH'),
-               status_reason = ?
-         WHERE ticker = ?
-        """,
-        (reason, ticker),
-    )
+#     # ticker_failures upsert
+#     cursor.execute(
+#         """
+#         INSERT INTO ticker_failures (
+#             ticker, job_name, failure_date, reason, error_class, error_message,
+#             first_seen_at, last_seen_at, fail_count
+#         )
+#         VALUES (?, 'price', date('now'), ?, ?, ?, datetime('now'), datetime('now'), 1)
+#         ON CONFLICT(ticker, job_name) DO UPDATE SET
+#             failure_date = date('now'),
+#             reason = excluded.reason,
+#             error_class = excluded.error_class,
+#             error_message = excluded.error_message,
+#             last_seen_at = datetime('now'),
+#             fail_count = ticker_failures.fail_count + 1
+#         """,
+#         (ticker, reason, err_class, err_msg),
+#     )
+#
+    # # ticker_data health fields
+    # cursor.execute(
+    #     """
+    #     UPDATE ticker_data
+    #        SET last_price_attempt_at = datetime('now'),
+    #            status = COALESCE(status, 'WATCH'),
+    #            status_reason = ?
+    #      WHERE ticker = ?
+    #     """,
+    #     (reason, ticker),
+    # )
 
 def _chunk(seq: list[str], size: int) -> list[list[str]]:
     return [seq[i:i+size] for i in range(0, len(seq), size)]

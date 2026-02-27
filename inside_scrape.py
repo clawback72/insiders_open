@@ -77,8 +77,12 @@ def main(db):
             "Counts: insider_data %d→%d, ticker_data %d→%d",
             before_ins, after_ins, before_tkr, after_tkr,
         )
+        
+        deactivated = reconcile_amendments(cursor)
+        logger.info("Amendment reconciliation deactivated=%d", deactivated)
 
         finish_run(cursor, run_id, status="SUCCESS", rows_inserted=rows_inserted)
+        
         db.commit()
 
     except Exception as e:
@@ -499,6 +503,62 @@ def insert_insiders(cursor, df, db):
 
     db.commit()
     return inserted, skipped, deactivated_total
+
+def reconcile_amendments(cursor, *, superseded_at_sql="datetime('now')") -> int:
+    """
+    For any natural-key group that contains an amendment (x_flags LIKE '%A%'),
+    keep the 'best' row active and deactivate the rest.
+    Returns number of rows deactivated.
+    """
+    # 1) Mark losers inactive + set superseded_by to the winning transaction_id
+    cursor.execute(f"""
+    WITH ranked AS (
+      SELECT
+        transaction_id,
+        ticker,
+        insider_name,
+        trade_date,
+        sec_tx_code,
+        x_flags,
+        filing_date,
+        scraped_at,
+        ROW_NUMBER() OVER (
+          PARTITION BY ticker, insider_name, trade_date, sec_tx_code
+          ORDER BY
+            CASE WHEN x_flags LIKE '%A%' THEN 1 ELSE 0 END DESC,
+            filing_date DESC,
+            scraped_at DESC,
+            transaction_id DESC
+        ) AS rn,
+        MAX(CASE WHEN x_flags LIKE '%A%' THEN 1 ELSE 0 END) OVER (
+          PARTITION BY ticker, insider_name, trade_date, sec_tx_code
+        ) AS has_amend,
+        FIRST_VALUE(transaction_id) OVER (
+          PARTITION BY ticker, insider_name, trade_date, sec_tx_code
+          ORDER BY
+            CASE WHEN x_flags LIKE '%A%' THEN 1 ELSE 0 END DESC,
+            filing_date DESC,
+            scraped_at DESC,
+            transaction_id DESC
+        ) AS winner_id
+      FROM insider_data
+      WHERE is_active = 1
+    )
+    UPDATE insider_data
+    SET
+      is_active = 0,
+      superseded_by = (SELECT winner_id FROM ranked r WHERE r.transaction_id = insider_data.transaction_id),
+      superseded_at = {superseded_at_sql}
+    WHERE transaction_id IN (
+      SELECT transaction_id
+      FROM ranked
+      WHERE has_amend = 1
+        AND rn > 1
+    );
+    """)
+    
+    deactivated = cursor.execute("SELECT changes()").fetchone()[0]
+    return deactivated  # number of rows updated (deactivated)
 
 def _scalar(db, sql, params=(), default=None):
     row = db.execute(sql, params).fetchone()
